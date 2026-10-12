@@ -62,7 +62,13 @@ class HybridRow:
 
 
 def hybrid_row(cursor, values):
+    """SQLite row factory: supports both name and positional lookup."""
     return HybridRow(cursor, values)
+
+
+def psycopg_hybrid_row_factory(cursor):
+    """Psycopg row factory: receive a cursor and return its row-maker."""
+    return lambda values: HybridRow(cursor, values)
 
 
 class DatabaseConnection:
@@ -78,8 +84,10 @@ class DatabaseConnection:
 
     @row_factory.setter
     def row_factory(self, _value):
-        # Keep named and indexed row access consistent on both database engines.
-        self.raw_connection.row_factory = hybrid_row
+        # Psycopg and sqlite3 use different row-factory callable contracts.
+        self.raw_connection.row_factory = (
+            psycopg_hybrid_row_factory if self.is_postgres else hybrid_row
+        )
 
     def execute(self, sql, params=()):
         if self.is_postgres:
@@ -98,9 +106,11 @@ def db_connect():
         if psycopg is None:
             raise RuntimeError("DATABASE_URL is set but psycopg is not installed")
         connection = psycopg.connect(
-            DATABASE_URL,
+            DATABASE_URL.replace("postgres://", "postgresql://", 1)
+            if DATABASE_URL.startswith("postgres://")
+            else DATABASE_URL,
             connect_timeout=10,
-            row_factory=hybrid_row,
+            row_factory=psycopg_hybrid_row_factory,
         )
         return DatabaseConnection(connection, is_postgres=True)
     return DatabaseConnection(
@@ -337,7 +347,7 @@ def send_push_to_user(username: str, payload: dict) -> tuple[int, int]:
                 "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE username = ?",
                 (username,),
             ).fetchall()
-    except sqlite3.Error:
+    except DATABASE_ERRORS:
         logger.warning("Could not read push subscriptions for delivery")
         return 0, 0
 
@@ -371,7 +381,7 @@ def send_push_to_user(username: str, payload: dict) -> tuple[int, int]:
                             (subscription["endpoint"],),
                         )
                         connection.commit()
-                except sqlite3.Error:
+                except DATABASE_ERRORS:
                     logger.warning("Could not remove an expired push subscription")
             logger.warning("Web push delivery failed (status=%s)", status_code or "unknown")
     return sent, failed
@@ -385,7 +395,7 @@ def send_push_to_all_users(payload: dict) -> tuple[int, int]:
                     "SELECT DISTINCT username FROM push_subscriptions"
                 ).fetchall()
             ]
-    except sqlite3.Error:
+    except DATABASE_ERRORS:
         logger.warning("Could not list push subscribers")
         return 0, 0
 
