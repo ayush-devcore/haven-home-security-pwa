@@ -264,6 +264,11 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
 class SecurityEventIn(BaseModel):
     event_type: DeviceEventType
     device_id: str = Field(default="esp32-main", min_length=1, max_length=64)
@@ -604,6 +609,43 @@ def login(payload: LoginRequest):
     if not password_ok:
         raise HTTPException(status_code=401, detail="Invalid username or password")
     return issue_access_token(username)
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    payload: PasswordChangeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Change the signed-in user's password after verifying the current password."""
+    user = get_user(current_user["username"])
+    if user is None:
+        raise HTTPException(status_code=401, detail="Account no longer exists")
+
+    try:
+        password_ok = password_hasher.verify(
+            payload.current_password,
+            user["password_hash"],
+        )
+    except Exception:
+        password_ok = False
+
+    if not password_ok:
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    new_hash = password_hasher.hash(payload.new_password)
+    try:
+        with closing(db_connect()) as connection:
+            connection.execute(
+                "UPDATE users SET password_hash = ? WHERE username = ?",
+                (new_hash, current_user["username"]),
+            )
+            connection.commit()
+    except DATABASE_ERRORS as exc:
+        raise HTTPException(status_code=503, detail="Unable to update password") from exc
+
+    return {
+        "message": "Password updated. Sign in again using your new password.",
+    }
 
 
 @app.get("/api/auth/me")
