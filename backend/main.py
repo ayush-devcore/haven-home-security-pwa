@@ -3,6 +3,12 @@ import logging
 import os
 import secrets
 import sqlite3
+
+try:
+    import psycopg
+except ImportError:  # SQLite remains available for local development.
+    psycopg = None
+
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,7 +32,81 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 DATABASE_PATH = BASE_DIR / "haven.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DEVICE_TOKEN = os.getenv("HAVEN_DEVICE_TOKEN", "")
+
+if psycopg is not None:
+    DATABASE_ERRORS = (sqlite3.Error, psycopg.Error)
+    DATABASE_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
+else:
+    DATABASE_ERRORS = (sqlite3.Error,)
+    DATABASE_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+
+
+class HybridRow:
+    """A row that supports both SQLite-style integer and name-based access."""
+
+    def __init__(self, cursor, values):
+        self._values = tuple(values)
+        description = cursor.description or ()
+        self._names = tuple(
+            (getattr(column, "name", None) or column[0])
+            for column in description
+        )
+        self._mapping = dict(zip(self._names, self._values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._mapping[key]
+
+
+def hybrid_row(cursor, values):
+    return HybridRow(cursor, values)
+
+
+class DatabaseConnection:
+    """Small adapter for the existing SQL, using PostgreSQL when configured."""
+
+    def __init__(self, raw_connection, is_postgres):
+        self.raw_connection = raw_connection
+        self.is_postgres = is_postgres
+
+    @property
+    def row_factory(self):
+        return getattr(self.raw_connection, "row_factory", None)
+
+    @row_factory.setter
+    def row_factory(self, _value):
+        # Keep named and indexed row access consistent on both database engines.
+        self.raw_connection.row_factory = hybrid_row
+
+    def execute(self, sql, params=()):
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+        return self.raw_connection.execute(sql, params)
+
+    def commit(self):
+        return self.raw_connection.commit()
+
+    def close(self):
+        return self.raw_connection.close()
+
+
+def db_connect():
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is set but psycopg is not installed")
+        connection = psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=10,
+            row_factory=hybrid_row,
+        )
+        return DatabaseConnection(connection, is_postgres=True)
+    return DatabaseConnection(
+        db_connect(),
+        is_postgres=False,
+    )
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_MINUTES = 30
@@ -75,7 +155,7 @@ def utc_now() -> datetime:
 
 def initialize_database() -> None:
     """Create missing tables without deleting existing events or users."""
-    with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+    with closing(db_connect()) as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS security_events (
@@ -107,8 +187,9 @@ def initialize_database() -> None:
         )
         connection.execute(
             """
-            INSERT OR IGNORE INTO system_state (id, armed, updated_at)
+            INSERT INTO system_state (id, armed, updated_at)
             VALUES (1, 0, ?)
+            ON CONFLICT (id) DO NOTHING
             """,
             (utc_now().isoformat(),),
         )
@@ -250,7 +331,7 @@ def send_push_to_user(username: str, payload: dict) -> tuple[int, int]:
         return 0, 0
 
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             connection.row_factory = sqlite3.Row
             subscriptions = connection.execute(
                 "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE username = ?",
@@ -284,7 +365,7 @@ def send_push_to_user(username: str, payload: dict) -> tuple[int, int]:
             status_code = getattr(response, "status_code", None)
             if status_code in (404, 410):
                 try:
-                    with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+                    with closing(db_connect()) as connection:
                         connection.execute(
                             "DELETE FROM push_subscriptions WHERE endpoint = ?",
                             (subscription["endpoint"],),
@@ -298,7 +379,7 @@ def send_push_to_user(username: str, payload: dict) -> tuple[int, int]:
 
 def send_push_to_all_users(payload: dict) -> tuple[int, int]:
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             usernames = [
                 row[0] for row in connection.execute(
                     "SELECT DISTINCT username FROM push_subscriptions"
@@ -318,7 +399,7 @@ def send_push_to_all_users(payload: dict) -> tuple[int, int]:
 
 
 def get_user(username: str):
-    with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+    with closing(db_connect()) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(
             """
@@ -464,7 +545,7 @@ def root():
 @app.get("/health")
 def health():
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             connection.execute("SELECT 1").fetchone()
         return {
             "status": "healthy",
@@ -472,7 +553,7 @@ def health():
             "database": "connected",
             "timestamp": utc_now().isoformat(),
         }
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
 
@@ -481,7 +562,7 @@ def register(payload: RegisterRequest):
     """Create the first local account. Extra registrations are disabled for now."""
     username = payload.username.strip().lower()
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             if user_count > 0:
                 raise HTTPException(status_code=403, detail="Initial registration is closed")
@@ -494,7 +575,7 @@ def register(payload: RegisterRequest):
                 (username, password_hash, utc_now().isoformat()),
             )
             connection.commit()
-    except sqlite3.IntegrityError as exc:
+    except DATABASE_INTEGRITY_ERRORS as exc:
         raise HTTPException(status_code=409, detail="Unable to create this account") from exc
 
     return {"username": username, "message": "Account created. Sign in to continue."}
@@ -523,9 +604,9 @@ def get_me(current_user: dict = Depends(get_current_user)):
 @app.get("/api/system/status", response_model=SystemStatus)
 def get_system_status(current_user: dict = Depends(get_current_user)):
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             return read_system_status(connection)
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to retrieve system status") from exc
 
 
@@ -536,9 +617,9 @@ def set_system_armed(
 ):
     event_for_push: SecurityEventRecord | None = None
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             connection.row_factory = sqlite3.Row
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN")
             current = connection.execute(
                 "SELECT armed FROM system_state WHERE id = 1"
             ).fetchone()
@@ -572,7 +653,7 @@ def set_system_armed(
                 )
             connection.commit()
             resulting_status = read_system_status(connection)
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to update system state") from exc
 
     if event_for_push is not None:
@@ -601,8 +682,8 @@ def trigger_simulated_event(
     safe_message = f"[SIMULATED] {user_message}"
 
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with closing(db_connect()) as connection:
+            connection.execute("BEGIN")
             armed_row = connection.execute(
                 "SELECT armed FROM system_state WHERE id = 1"
             ).fetchone()
@@ -638,19 +719,19 @@ def trigger_simulated_event(
             "events_created": [event.model_dump(mode="json") for event in created_events],
             "message": "Simulated events saved. No physical hardware was controlled.",
         }
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to save simulated event") from exc
 
 
 @app.get("/api/push/status")
 def get_push_status(current_user: dict = Depends(get_current_user)):
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM push_subscriptions WHERE username = ?",
                 (current_user["username"],),
             ).fetchone()[0]
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to read push status") from exc
     return {
         "configured": push_is_configured(),
@@ -680,7 +761,7 @@ def subscribe_to_push(
         raise HTTPException(status_code=422, detail="Push endpoint must use HTTPS")
     timestamp = utc_now().isoformat()
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO push_subscriptions
@@ -698,7 +779,7 @@ def subscribe_to_push(
                 ),
             )
             connection.commit()
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to save push subscription") from exc
     return {"subscribed": True, "message": "Browser push subscription saved."}
 
@@ -709,13 +790,13 @@ def unsubscribe_from_push(
     current_user: dict = Depends(get_current_user),
 ):
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             connection.execute(
                 "DELETE FROM push_subscriptions WHERE username = ? AND endpoint = ?",
                 (current_user["username"], payload.endpoint),
             )
             connection.commit()
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to remove push subscription") from exc
     return {"subscribed": False, "message": "Browser push subscription removed."}
 
@@ -725,12 +806,12 @@ def test_push(current_user: dict = Depends(get_current_user)):
     if not push_is_configured():
         raise HTTPException(status_code=503, detail="Web push is not configured yet")
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM push_subscriptions WHERE username = ?",
                 (current_user["username"],),
             ).fetchone()[0]
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to check push subscriptions") from exc
     if not count:
         raise HTTPException(status_code=409, detail="Enable browser push notifications first")
@@ -760,7 +841,7 @@ def test_push(current_user: dict = Depends(get_current_user)):
 )
 def create_event(payload: SecurityEventIn):
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             event = insert_event(
                 connection,
                 payload.event_type,
@@ -768,7 +849,7 @@ def create_event(payload: SecurityEventIn):
                 payload.message,
             )
             connection.commit()
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to save security event") from exc
 
     # Hardware-originated events notify every account with an active subscription.
@@ -779,7 +860,7 @@ def create_event(payload: SecurityEventIn):
 @app.get("/api/events", response_model=list[SecurityEventRecord])
 def get_events(current_user: dict = Depends(get_current_user)):
     try:
-        with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as connection:
+        with closing(db_connect()) as connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 """
@@ -790,5 +871,5 @@ def get_events(current_user: dict = Depends(get_current_user)):
                 """
             ).fetchall()
         return [dict(row) for row in rows]
-    except sqlite3.Error as exc:
+    except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to retrieve security events") from exc
