@@ -104,7 +104,7 @@ def db_connect():
         )
         return DatabaseConnection(connection, is_postgres=True)
     return DatabaseConnection(
-        db_connect(),
+        sqlite3.connect(DATABASE_PATH, timeout=5),
         is_postgres=False,
     )
 JWT_SECRET = os.getenv("JWT_SECRET", "")
