@@ -60,6 +60,10 @@ class HybridRow:
             return self._values[key]
         return self._mapping[key]
 
+    def keys(self):
+        """Expose mapping keys so dict(row) works like it does for sqlite3.Row."""
+        return self._mapping.keys()
+
 
 def hybrid_row(cursor, values):
     """SQLite row factory: supports both name and positional lookup."""
