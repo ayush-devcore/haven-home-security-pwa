@@ -789,10 +789,27 @@ def get_push_status(current_user: dict = Depends(get_current_user)):
             ).fetchone()[0]
     except DATABASE_ERRORS as exc:
         raise HTTPException(status_code=503, detail="Unable to read push status") from exc
+
+    subject_valid = (
+        VAPID_SUBJECT.startswith("mailto:")
+        or VAPID_SUBJECT.startswith("https://")
+    )
+    private_key_file_found = VAPID_PRIVATE_KEY_PATH.is_file()
+    private_key_file_readable = (
+        private_key_file_found and os.access(VAPID_PRIVATE_KEY_PATH, os.R_OK)
+    )
+    diagnostics = {
+        "push_library_available": webpush is not None,
+        "public_key_present": bool(VAPID_PUBLIC_KEY),
+        "private_key_file_found": private_key_file_found,
+        "private_key_file_readable": private_key_file_readable,
+        "subject_valid": subject_valid,
+    }
     return {
         "configured": push_is_configured(),
         "subscribed": count > 0,
         "subscription_count": count,
+        "diagnostics": diagnostics,
     }
 
 
