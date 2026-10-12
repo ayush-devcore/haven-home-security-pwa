@@ -180,6 +180,7 @@ function App() {
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [signedInUsername, setSignedInUsername] = useState("");
   const [authError, setAuthError] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
@@ -606,6 +607,7 @@ function App() {
 
       setSignedInUsername(loginUsername.trim());
       setLoginPassword("");
+      setShowLoginPassword(false);
       setAuthError("");
       setEvents([]);
       setEventsError("");
@@ -689,17 +691,41 @@ function App() {
             />
 
             <label className="auth-label" htmlFor="haven-password">Password</label>
-            <input
-              className="auth-input"
-              id="haven-password"
-              name="password"
-              type="password"
-              autoComplete="current-password"
-              value={loginPassword}
-              onChange={(event) => setLoginPassword(event.target.value)}
-              required
-              disabled={loginBusy}
-            />
+            <div className="auth-password-field">
+              <input
+                className="auth-input auth-password-input"
+                id="haven-password"
+                name="password"
+                type={showLoginPassword ? "text" : "password"}
+                autoComplete="current-password"
+                value={loginPassword}
+                onChange={(event) => setLoginPassword(event.target.value)}
+                required
+                disabled={loginBusy}
+              />
+              <button
+                className="auth-password-toggle"
+                type="button"
+                aria-label={showLoginPassword ? "Hide password" : "Show password"}
+                aria-pressed={showLoginPassword}
+                onClick={() => setShowLoginPassword((visible) => !visible)}
+                disabled={loginBusy}
+              >
+                {showLoginPassword ? (
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M3 3l18 18" />
+                    <path d="M10.6 10.6a2 2 0 0 0 2.8 2.8" />
+                    <path d="M9.9 5.2A11.8 11.8 0 0 1 12 5c5 0 8.5 4.2 9.5 7-.4 1.1-1.2 2.4-2.4 3.5" />
+                    <path d="M6.2 6.2C3.9 7.7 2.7 10 2.5 12c1 2.8 4.5 7 9.5 7 1.2 0 2.4-.3 3.4-.7" />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7Z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                )}
+              </button>
+            </div>
 
             {authError && (
               <p className="auth-error" role="alert">{authError}</p>
