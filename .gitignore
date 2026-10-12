@@ -44,3 +44,22 @@ secrets.yml
 coverage/
 .netlify/
 .vercel/
+
+# Python backend
+backend/.venv/
+backend/**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local development database
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# Local-only secrets and runtime data for Haven API
+.env
+haven.db
+vapid_private.pem
+.venv/
+__pycache__/
+*.py[cod]
